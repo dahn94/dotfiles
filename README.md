@@ -17,6 +17,15 @@ No FreeBSD, as ferramentas nativas (lua-language-server, stylua, shfmt, ruff,
 tflint, terraform-ls, sqlfluff) vêm do `pkg`, porque o Mason não tem binários
 para essa plataforma — veja `nvim/lua/plugins/freebsd.lua`.
 
+## Scripts (`bin/`)
+
+No macOS o `install.sh` linka cada script de `bin/` em `~/bin`.
+
+- `fbsd`: cria e gerencia VMs FreeBSD arm64 com QEMU + HVF em Macs Apple Silicon.
+  A VM compartilha `/Users/Shared/NOME` do Mac em `~/shared`. Veja `fbsd help`.
+
+## Atalhos
+
 Atalhos extras além dos padrões do LazyVim:
 
 | Tecla | Ação |

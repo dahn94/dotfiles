@@ -52,9 +52,19 @@ link_config() {
   info "Linkado $NVIM_DIR -> $DOTFILES/nvim"
 }
 
+# Scripts de bin/ vão para ~/bin. Só no macOS: o fbsd roda no Mac (QEMU + HVF).
+link_bin() {
+  [ "$(uname -s)" = Darwin ] || return 0
+  mkdir -p "$HOME/bin"
+  for f in "$DOTFILES"/bin/*; do
+    ln -sf "$f" "$HOME/bin/$(basename "$f")"
+    info "Linkado ~/bin/$(basename "$f") -> $f"
+  done
+}
+
 case "${1:-}" in
-  "") install_deps; link_config ;;
-  --config) link_config ;;
+  "") install_deps; link_config; link_bin ;;
+  --config) link_config; link_bin ;;
   *) echo "uso: $0 [--config]" >&2; exit 1 ;;
 esac
 

@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2153,SC2054  # variáveis vêm de vm.conf; vírgulas são opções do QEMU
+# fbsd — VMs FreeBSD arm64 no macOS (Apple Silicon) via QEMU + HVF
+#
+# Dependências:  brew install qemu xz xorriso
+#
+# Uso rápido:
+#   fbsd create devfbs                  # baixa a imagem, cria a VM e compartilha /Users/Shared/devfbs
+#   fbsd start devfbs                   # sobe em background e espera o SSH
+#   fbsd ssh devfbs                     # entra na VM
+#   fbsd stop devfbs                    # desliga
+#
+# Compatível com o bash 3.2 que vem no macOS.
+set -euo pipefail
+
+FBSD_HOME="${FBSD_HOME:-$HOME/.fbsd-vm}"
+CACHE_DIR="$FBSD_HOME/cache"
+MIRROR="${FBSD_MIRROR:-https://download.freebsd.org}"
+# Pasta compartilhada padrão no Mac: /Users/Shared/NOME ("Compartilhado" no Finder)
+SHARED_ROOT="${FBSD_SHARED_ROOT:-/Users/Shared}"
+
+DEFAULT_VERSION="15.1"
+DEFAULT_FS="zfs"
+DEFAULT_DISK="40G"
+DEFAULT_MEM="8G"
+
+die()  { printf 'fbsd: %s\n' "$*" >&2; exit 1; }
+info() { printf '==> %s\n' "$*"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "'$1' não encontrado. Rode: brew install ${2:-$1}"
+}
+
+usage() {
+  cat <<'EOF'
+fbsd — VMs FreeBSD arm64 no macOS via QEMU + HVF
+
+Comandos:
+  create NOME [opções]   Cria a VM (baixa a imagem oficial se preciso)
+      --version X.Y        Versão RELEASE (padrão: 15.1)
+      --fs zfs|ufs         Sistema de arquivos da imagem (padrão: zfs)
+      --disk TAM           Tamanho do disco, ex. 40G (padrão: 40G)
+      --cpus N             vCPUs (padrão: núcleos de performance do Mac)
+      --mem TAM            Memória, ex. 8G (padrão: 8G)
+      --share DIR          Pasta do Mac espelhada em ~/shared na VM (virtio-9p)
+                           (padrão: /Users/Shared/NOME, criada se não existir)
+      --no-share           Não compartilha nenhuma pasta
+      --port N             Porta local do SSH (padrão: primeira livre a partir de 2222)
+      --user NOME          Usuário na VM (padrão: seu usuário do Mac)
+  start NOME [--fg]      Sobe a VM (em background; --fg mostra o console no terminal)
+  stop NOME [--force]    Desliga (shutdown limpo; --force mata o QEMU)
+  ssh NOME [cmd...]      SSH na VM
+  console NOME           Acompanha o console serial (log)
+  ssh-config NOME        Imprime um bloco para colar em ~/.ssh/config
+  list                   Lista as VMs e o estado
+  destroy NOME           Apaga a VM (pede confirmação)
+EOF
+}
+
+vm_dir() { printf '%s/%s' "$FBSD_HOME" "$1"; }
+
+load_vm() {
+  local name="$1"
+  DIR="$(vm_dir "$name")"
+  [ -f "$DIR/vm.conf" ] || die "VM '$name' não existe (veja: fbsd list)"
+  # shellcheck disable=SC1091
+  . "$DIR/vm.conf"
+}
+
+is_running() {
+  [ -f "$DIR/qemu.pid" ] && kill -0 "$(cat "$DIR/qemu.pid")" 2>/dev/null
+}
+
+firmware() {
+  local fw
+  fw="$(brew --prefix qemu 2>/dev/null)/share/qemu/edk2-aarch64-code.fd"
+  [ -f "$fw" ] || die "firmware EFI não encontrado em $fw (o qemu do Homebrew está instalado?)"
+  printf '%s' "$fw"
+}
+
+free_port() {
+  local p=2222
+  while nc -z 127.0.0.1 "$p" >/dev/null 2>&1 || grep -qs "^PORT=$p\$" "$FBSD_HOME"/*/vm.conf; do
+    p=$((p + 1))
+  done
+  printf '%s' "$p"
+}
+
+find_pubkey() {
+  local k
+  for k in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
+    [ -f "$k" ] && { printf '%s' "$k"; return; }
+  done
+  die "nenhuma chave SSH pública em ~/.ssh. Crie uma com: ssh-keygen -t ed25519"
+}
+
+ssh_opts() {
+  printf '%s\n' -p "$PORT" \
+    -o "UserKnownHostsFile=$DIR/known_hosts" \
+    -o StrictHostKeyChecking=accept-new \
+    -o LogLevel=ERROR
+}
+
+# ---------------------------------------------------------------- create
+cmd_create() {
+  [ $# -ge 1 ] || die "uso: fbsd create NOME [opções]"
+  local name="$1"; shift
+  local version="$DEFAULT_VERSION" fs="$DEFAULT_FS" disk="$DEFAULT_DISK" mem="$DEFAULT_MEM"
+  local cpus="" share="" no_share="" port="" user
+  user="$(id -un | tr '[:upper:]' '[:lower:]')"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) version="$2"; shift 2 ;;
+      --fs)      fs="$2"; shift 2 ;;
+      --disk)    disk="$2"; shift 2 ;;
+      --cpus)    cpus="$2"; shift 2 ;;
+      --mem)     mem="$2"; shift 2 ;;
+      --share)   share="$2"; shift 2 ;;
+      --no-share) no_share=1; shift ;;
+      --port)    port="$2"; shift 2 ;;
+      --user)    user="$2"; shift 2 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+  done
+
+  need qemu-system-aarch64 qemu
+  need qemu-img qemu
+  need xz
+  need xorriso
+  [ "$(uname -m)" = "arm64" ] || die "este script é para Macs Apple Silicon (arm64)"
+  case "$fs" in zfs|ufs) ;; *) die "--fs deve ser zfs ou ufs" ;; esac
+  case "$name" in *[!a-zA-Z0-9-]*|"") die "nome inválido: use letras, números e hífen" ;; esac
+
+  DIR="$(vm_dir "$name")"
+  [ -e "$DIR" ] && die "VM '$name' já existe em $DIR"
+
+  if [ -n "$no_share" ]; then
+    share=""
+  elif [ -z "$share" ]; then
+    share="$SHARED_ROOT/$name"
+    mkdir -p "$share" || die "não consegui criar $share"
+  fi
+  if [ -n "$share" ]; then
+    [ -d "$share" ] || die "pasta de compartilhamento não existe: $share"
+    share="$(cd "$share" && pwd -P)"
+  fi
+  [ -n "$cpus" ] || cpus="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu)"
+  [ -n "$port" ] || port="$(free_port)"
+
+  local pubkey; pubkey="$(find_pubkey)"
+
+  # --- imagem oficial (com cache e verificação de checksum)
+  local rel="${version}-RELEASE"
+  local file="FreeBSD-${rel}-arm64-aarch64-BASIC-CLOUDINIT-${fs}.qcow2.xz"
+  local base="$MIRROR/releases/VM-IMAGES/${rel}/aarch64/Latest"
+  mkdir -p "$CACHE_DIR"
+
+  if [ ! -f "$CACHE_DIR/${file%.xz}" ]; then
+    info "Baixando $file"
+    curl -fL --progress-bar -o "$CACHE_DIR/$file.part" "$base/$file" \
+      || die "falha no download. A versão $rel existe? Veja $MIRROR/releases/VM-IMAGES/"
+    mv "$CACHE_DIR/$file.part" "$CACHE_DIR/$file"
+
+    info "Verificando SHA256"
+    local expected actual
+    expected="$(curl -fsL "$base/CHECKSUM.SHA256" | grep "($file)" | sed 's/.*= //')"
+    actual="$(shasum -a 256 "$CACHE_DIR/$file" | cut -d' ' -f1)"
+    [ -n "$expected" ] && [ "$expected" = "$actual" ] \
+      || { rm -f "$CACHE_DIR/$file"; die "checksum não confere para $file"; }
+
+    info "Descompactando"
+    xz -d "$CACHE_DIR/$file"
+  fi
+
+  mkdir -p "$DIR"
+  info "Criando disco ($disk) a partir da imagem"
+  cp "$CACHE_DIR/${file%.xz}" "$DIR/disk.qcow2"
+  qemu-img resize -q "$DIR/disk.qcow2" "$disk"   # o FreeBSD expande a partição no 1º boot
+
+  # --- seed cloud-init (nuageinit / NoCloud)
+  info "Gerando configuração de primeiro boot"
+  local seed="$DIR/seed"
+  mkdir -p "$seed"
+  printf 'instance-id: %s\nlocal-hostname: %s\n' "$name-$(date +%s)" "$name" > "$seed/meta-data"
+
+  {
+    printf '#cloud-config\n'
+    printf 'hostname: %s\n' "$name"
+    printf 'ssh_pwauth: false\n'
+    printf 'users:\n'
+    printf '  - name: %s\n' "$user"
+    printf '    gecos: Dev\n'
+    printf '    groups: wheel\n'
+    printf '    shell: /bin/sh\n'
+    printf '    sudo: ALL=(ALL) NOPASSWD:ALL\n'
+    printf '    ssh_authorized_keys:\n'
+    printf '      - %s\n' "$(cat "$pubkey")"
+    printf 'packages:\n'
+    printf '  - sudo\n'
+    printf '  - git\n'
+    printf 'runcmd:\n'
+    # Evita consumo alto de CPU com a VM ociosa sob HVF
+    printf '  - sysrc -f /boot/loader.conf kern.hz=100\n'
+    if [ -n "$share" ]; then
+      # Mesmo UID do Mac, para ler e escrever na pasta compartilhada sem brigar com permissões
+      printf '  - pw usermod %s -u %s\n' "$user" "$(id -u)"
+      printf '  - chown -R %s /home/%s\n' "$(id -u)" "$user"
+      printf '  - sysrc -f /boot/loader.conf virtio_p9fs_load=YES\n'
+      printf '  - kldload -n virtio_p9fs\n'
+      printf '  - mkdir -p /home/%s/shared\n' "$user"
+      printf '  - echo "host /home/%s/shared p9fs rw,late,failok 0 0" >> /etc/fstab\n' "$user"
+      printf '  - mount /home/%s/shared\n' "$user"
+    fi
+  } > "$seed/user-data"
+
+  xorriso -as mkisofs -quiet -o "$DIR/seed.iso" -V cidata -J -r "$seed" >/dev/null 2>&1 \
+    || die "falha ao gerar seed.iso com xorriso"
+
+  cat > "$DIR/vm.conf" <<EOF
+NAME=$name
+VERSION=$rel
+CPUS=$cpus
+MEM=$mem
+PORT=$port
+VMUSER=$user
+SHARE='$share'
+EOF
+
+  info "VM '$name' criada: $rel ($fs), ${cpus} vCPUs, $mem RAM, disco $disk, SSH na porta $port"
+  [ -n "$share" ] && info "Pasta compartilhada: $share  ->  /home/$user/shared"
+  printf '\nPróximo passo:  fbsd start %s\n' "$name"
+}
+
+# ---------------------------------------------------------------- start
+qemu_args() {
+  local fw; fw="$(firmware)"
+  QARGS=(
+    -name "$NAME"
+    -machine virt -accel hvf -cpu host
+    -smp "$CPUS" -m "$MEM"
+    -bios "$fw"
+    -drive "if=none,id=hd0,file=$DIR/disk.qcow2,format=qcow2,discard=unmap,cache=writeback"
+    -device virtio-blk-pci,drive=hd0
+    -drive "if=none,id=seed,file=$DIR/seed.iso,format=raw,readonly=on"
+    -device virtio-blk-pci,drive=seed
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22"
+    -device virtio-net-pci,netdev=net0
+    -device virtio-rng-pci
+    -monitor "unix:$DIR/monitor.sock,server,nowait"
+    -pidfile "$DIR/qemu.pid"
+  )
+  if [ -n "${SHARE:-}" ]; then
+    [ -d "$SHARE" ] || die "pasta compartilhada não existe mais: $SHARE"
+    QARGS+=(-virtfs "local,path=$SHARE,mount_tag=host,security_model=none,id=share0")
+  fi
+}
+
+wait_ssh() {
+  local i=0 max=300
+  printf '==> Esperando o SSH (o 1º boot instala pacotes e pode levar alguns minutos)'
+  while [ $i -lt $max ]; do
+    # shellcheck disable=SC2046
+    if ssh $(ssh_opts) -o BatchMode=yes -o ConnectTimeout=3 "$VMUSER@127.0.0.1" true 2>/dev/null; then
+      printf ' pronto.\n'; return 0
+    fi
+    is_running || { printf '\n'; die "o QEMU parou. Veja: fbsd console $NAME"; }
+    printf '.'; sleep 3; i=$((i + 3))
+  done
+  printf '\n'
+  die "SSH não respondeu em ${max}s. Veja o console: fbsd console $NAME"
+}
+
+cmd_start() {
+  [ $# -ge 1 ] || die "uso: fbsd start NOME [--fg]"
+  load_vm "$1"
+  is_running && { info "'$NAME' já está rodando (porta $PORT)"; return 0; }
+  rm -f "$DIR/monitor.sock"
+  qemu_args
+
+  if [ "${2:-}" = "--fg" ]; then
+    info "Console no terminal. Para sair do QEMU: Ctrl-A depois X"
+    exec qemu-system-aarch64 "${QARGS[@]}" -nographic
+  fi
+
+  : > "$DIR/console.log"
+  qemu-system-aarch64 "${QARGS[@]}" -display none -serial "file:$DIR/console.log" -daemonize
+  info "'$NAME' iniciada (PID $(cat "$DIR/qemu.pid"))"
+  wait_ssh
+  printf 'Entre com:  fbsd ssh %s\n' "$NAME"
+}
+
+# ---------------------------------------------------------------- stop
+cmd_stop() {
+  [ $# -ge 1 ] || die "uso: fbsd stop NOME [--force]"
+  load_vm "$1"
+  is_running || { info "'$NAME' não está rodando"; return 0; }
+
+  if [ "${2:-}" != "--force" ]; then
+    info "Desligando '$NAME'"
+    # shellcheck disable=SC2046
+    ssh $(ssh_opts) -o BatchMode=yes -o ConnectTimeout=5 "$VMUSER@127.0.0.1" \
+      'sudo shutdown -p now' >/dev/null 2>&1 || true
+    local i=0
+    while is_running && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done
+  fi
+
+  if is_running; then
+    info "Encerrando o QEMU à força"
+    echo quit | nc -U "$DIR/monitor.sock" >/dev/null 2>&1 || kill "$(cat "$DIR/qemu.pid")" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$DIR/qemu.pid" "$DIR/monitor.sock"
+  info "'$NAME' parada"
+}
+
+# ---------------------------------------------------------------- outros
+cmd_ssh() {
+  [ $# -ge 1 ] || die "uso: fbsd ssh NOME [cmd...]"
+  load_vm "$1"; shift
+  is_running || die "'$NAME' não está rodando. Rode: fbsd start $NAME"
+  # shellcheck disable=SC2046
+  exec ssh $(ssh_opts) "$VMUSER@127.0.0.1" "$@"
+}
+
+cmd_console() {
+  [ $# -ge 1 ] || die "uso: fbsd console NOME"
+  load_vm "$1"
+  [ -f "$DIR/console.log" ] || die "sem log de console ainda"
+  info "Ctrl-C para sair (só leitura; para console interativo use: fbsd start $NAME --fg)"
+  exec tail -f "$DIR/console.log"
+}
+
+cmd_ssh_config() {
+  [ $# -ge 1 ] || die "uso: fbsd ssh-config NOME"
+  load_vm "$1"
+  cat <<EOF
+Host $NAME
+  HostName 127.0.0.1
+  Port $PORT
+  User $VMUSER
+  UserKnownHostsFile $DIR/known_hosts
+  StrictHostKeyChecking accept-new
+EOF
+}
+
+cmd_list() {
+  [ -d "$FBSD_HOME" ] || { echo "(nenhuma VM)"; return 0; }
+  local c found=0
+  printf '%-16s %-16s %-6s %-5s %-5s %s\n' NOME VERSÃO PORTA CPUS MEM ESTADO
+  for c in "$FBSD_HOME"/*/vm.conf; do
+    [ -f "$c" ] || continue
+    found=1
+    (
+      load_vm "$(basename "$(dirname "$c")")"
+      st=parada; is_running && st=rodando
+      printf '%-16s %-16s %-6s %-5s %-5s %s\n' "$NAME" "$VERSION" "$PORT" "$CPUS" "$MEM" "$st"
+    )
+  done
+  [ $found -eq 1 ] || echo "(nenhuma VM)"
+}
+
+cmd_destroy() {
+  [ $# -ge 1 ] || die "uso: fbsd destroy NOME"
+  load_vm "$1"
+  is_running && die "'$NAME' está rodando. Rode antes: fbsd stop $NAME"
+  printf "Apagar a VM '%s' e o disco em %s? [digite o nome para confirmar] " "$NAME" "$DIR"
+  local ans; read -r ans
+  [ "$ans" = "$NAME" ] || die "cancelado"
+  rm -rf "$DIR"
+  info "'$NAME' apagada (a imagem base continua em $CACHE_DIR)"
+}
+
+# ---------------------------------------------------------------- main
+[ $# -ge 1 ] || { usage; exit 1; }
+cmd="$1"; shift
+case "$cmd" in
+  create)      cmd_create "$@" ;;
+  start)       cmd_start "$@" ;;
+  stop)        cmd_stop "$@" ;;
+  ssh)         cmd_ssh "$@" ;;
+  console)     cmd_console "$@" ;;
+  ssh-config)  cmd_ssh_config "$@" ;;
+  list|ls)     cmd_list ;;
+  destroy|rm)  cmd_destroy "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
