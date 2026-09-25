@@ -5,10 +5,10 @@
 # Dependências:  brew install qemu xz xorriso
 #
 # Uso rápido:
-#   fbsd create devfbs                  # baixa a imagem, cria a VM e compartilha /Users/Shared/devfbs
-#   fbsd start devfbs                   # sobe em background e espera o SSH
-#   fbsd ssh devfbs                     # entra na VM
-#   fbsd stop devfbs                    # desliga
+#   fbsd create devfbsd                 # baixa a imagem, cria a VM e compartilha ~/shared/devfbsd
+#   fbsd start devfbsd                  # sobe em background e espera o SSH
+#   fbsd ssh devfbsd                    # entra na VM
+#   fbsd stop devfbsd                   # desliga
 #
 # Compatível com o bash 3.2 que vem no macOS.
 set -euo pipefail
@@ -16,8 +16,8 @@ set -euo pipefail
 FBSD_HOME="${FBSD_HOME:-$HOME/.fbsd-vm}"
 CACHE_DIR="$FBSD_HOME/cache"
 MIRROR="${FBSD_MIRROR:-https://download.freebsd.org}"
-# Pasta compartilhada padrão no Mac: /Users/Shared/NOME ("Compartilhado" no Finder)
-SHARED_ROOT="${FBSD_SHARED_ROOT:-/Users/Shared}"
+# Pasta compartilhada padrão no Mac: ~/shared/NOME (aparece em ~/shared dentro da VM)
+SHARED_ROOT="${FBSD_SHARED_ROOT:-$HOME/shared}"
 
 DEFAULT_VERSION="15.1"
 DEFAULT_FS="zfs"
@@ -43,7 +43,7 @@ Comandos:
       --cpus N             vCPUs (padrão: núcleos de performance do Mac)
       --mem TAM            Memória, ex. 8G (padrão: 8G)
       --share DIR          Pasta do Mac espelhada em ~/shared na VM (virtio-9p)
-                           (padrão: /Users/Shared/NOME, criada se não existir)
+                           (padrão: ~/shared/NOME, criada se não existir)
       --no-share           Não compartilha nenhuma pasta
       --port N             Porta local do SSH (padrão: primeira livre a partir de 2222)
       --user NOME          Usuário na VM (padrão: seu usuário do Mac)

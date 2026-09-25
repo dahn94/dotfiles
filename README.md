@@ -22,7 +22,7 @@ para essa plataforma — veja `nvim/lua/plugins/freebsd.lua`.
 No macOS o `install.sh` linka cada script de `bin/` em `~/bin`.
 
 - `fbsd`: cria e gerencia VMs FreeBSD arm64 com QEMU + HVF em Macs Apple Silicon.
-  A VM compartilha `/Users/Shared/NOME` do Mac em `~/shared`. Veja `fbsd help`.
+  A VM compartilha `~/shared/NOME` do Mac em `~/shared` dentro da VM. Veja `fbsd help`.
 
 ## Atalhos
 
