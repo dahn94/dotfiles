@@ -7,9 +7,9 @@ Config baseada no [LazyVim](https://www.lazyvim.org), com os extras de Elixir,
 Erlang, Python, SQL, Terraform, TOML, YAML, Git e Claude Code (`nvim/lazyvim.json`).
 
 ```sh
-git clone https://github.com/dahn94/dotfiles ~/dotfiles
-~/dotfiles/install.sh            # dependências + link ~/.config/nvim -> ~/dotfiles/nvim
-~/dotfiles/install.sh --config   # só o link
+git clone https://github.com/dahn94/dotfiles ~/.dotfiles
+~/.dotfiles/install.sh            # dependências + link ~/.config/nvim -> ~/.dotfiles/nvim
+~/.dotfiles/install.sh --config   # só o link
 ```
 
 Funciona em FreeBSD (`pkg`), macOS (`brew`) e Debian/Ubuntu (`apt`).
